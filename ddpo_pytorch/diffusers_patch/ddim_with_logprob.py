@@ -43,7 +43,6 @@ def ddim_step_with_logprob(
     sample: torch.FloatTensor,
     eta: float = 0.0,
     use_clipped_model_output: bool = False,
-    generator=None,
     prev_sample: Optional[torch.FloatTensor] = None,
 ) -> Union[DDIMSchedulerOutput, Tuple]:
     """
@@ -60,7 +59,6 @@ def ddim_step_with_logprob(
             predicted original sample. Necessary because predicted original sample is clipped to [-1, 1] when
             `self.config.clip_sample` is `True`. If no clipping has happened, "corrected" `model_output` would
             coincide with the one provided as input and `use_clipped_model_output` will have not effect.
-        generator: random number generator.
         variance_noise (`torch.FloatTensor`): instead of generating noise for the variance using `generator`, we
             can directly provide the noise for the variance itself. This is useful for methods such as
             CycleDiffusion. (https://arxiv.org/abs/2210.05559)
@@ -165,19 +163,11 @@ def ddim_step_with_logprob(
         alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
     )
 
-    if prev_sample is not None and generator is not None:
-        raise ValueError(
-            "Cannot pass both generator and prev_sample. Please make sure that either `generator` or"
-            " `prev_sample` stays `None`."
-        )
 
     if prev_sample is None:
-        variance_noise = randn_tensor(
-            model_output.shape,
-            generator=generator,
-            device=model_output.device,
-            dtype=model_output.dtype,
-        )
+        variance_noise = torch.randn(model_output.shape, device= model_output.device)   
+
+
         prev_sample = prev_sample_mean + std_dev_t * variance_noise
 
     # log prob of prev_sample given prev_sample_mean and std_dev_t

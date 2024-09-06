@@ -13,17 +13,15 @@ from diffusers import StableDiffusionPipeline, DDIMScheduler, UNet2DConditionMod
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 import numpy as np
-import ddpo_pytorch.prompts
-import ddpo_pytorch.rewards
-from ddpo_pytorch.stat_tracking import PerPromptStatTracker
 from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
 from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
+from model.transformer_3d import PointDiffusionTransformer
 import torch
 import wandb
+import pickle
 from functools import partial
 import tqdm
 import tempfile
-from PIL import Image
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -33,6 +31,79 @@ config_flags.DEFINE_config_file("config", "config/base.py", "Training configurat
 
 logger = get_logger(__name__)
 
+
+def load_model(config_pretrained):
+    """
+    Load the pretrained model.
+    Args:
+        config_pretrained: the configuration of the pretrained model.
+    Returns:    
+        model: the pretrained model.
+    """
+    # modol for 3d wings design
+    model = PointDiffusionTransformer(
+        dtype=torch.float32,
+        n_ctx = config_pretrained.num_3d_points, # number of points in the 3D point cloud
+        heads = config_pretrained.n_head, # number of heads in transformer
+        time_token_cond = True # condition on time token
+    )
+
+    # load the pretrained model and change keys in the state dict to match the current model by removing the prefix 'model.' if it exists
+    state_dict = torch.load(config_pretrained.model_path)["model"]
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        k = k.replace("model.", "")
+        new_state_dict[k] = v
+    # remove the keys that do not exist in the current model
+    state_dict = {k: v for k, v in new_state_dict.items() if k in model.state_dict()}
+    model.load_state_dict(state_dict)
+    
+    return model
+
+
+def normalize(x, min_max, key):
+    """
+    Normalize the input data x to [-1, 1] using the min and max values of the key.
+    """
+    return 2 * (x - min_max[key + "_min"]) / (min_max[key + "_max"] - min_max[key + "_min"]) - 1
+
+def prepare_condition(config_conditions, batch_size):
+    """
+    Prepare the conditions for the aircraft design.
+    Args:
+        config_conditions: the configuration of the conditions.
+        batch_size: the batch size of the conditions.
+    Returns:
+        batch_normalized_cond: the normalized conditions.
+    
+    """
+    normdict = pickle.load(open(config_conditions.normdict_path, "rb"))
+    normalized_alpha = normalize(config_conditions.alpha, normdict, "alpha")
+    normalized_mach = normalize(config_conditions.Ma, normdict, "Ma")
+    normalized_label_condition = torch.tensor([normalized_alpha, normalized_mach], dtype = torch.float32)            
+    batch_normalized_cond = torch.tile(normalized_label_condition, [batch_size, 1])
+    if config_conditions.cond_force:
+        normalized_lift = normalize(config_conditions.Cl, normdict, "Cl")
+        normalized_drag = normalize(config_conditions.Cd, normdict, "Cd")
+        normalized_force = torch.tensor([normalized_lift, normalized_drag], dtype = torch.float32)
+        batch_normalized_force_cond = torch.tile(normalized_force, [batch_size, 1])
+        batch_normalized_cond = torch.cat([batch_normalized_cond, batch_normalized_force_cond], dim = 1)
+        
+    return batch_normalized_cond
+
+def reward_fn(images):
+    """
+    Reward function to compute lift / drag of the aircraft.
+    Args:
+        images: the generated images of the aircraft.
+    Returns:
+        rewards: the rewards of the aircraft.
+    """
+    # TODO: implement reward function for aircraft design
+    import random
+    batch_size = images.shape[0]
+    
+    return [random.random() for _ in range(batch_size)]
 
 def main(_):
     # basic Accelerate and logging setup
@@ -44,19 +115,20 @@ def main(_):
     else:
         config.run_name += "_" + unique_id
 
-    if config.resume_from:
-        config.resume_from = os.path.normpath(os.path.expanduser(config.resume_from))
-        if "checkpoint_" not in os.path.basename(config.resume_from):
-            # get the most recent checkpoint in this directory
-            checkpoints = list(
-                filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from))
-            )
-            if len(checkpoints) == 0:
-                raise ValueError(f"No checkpoints found in {config.resume_from}")
-            config.resume_from = os.path.join(
-                config.resume_from,
-                sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
-            )
+    # if config.resume_from:
+    #     config.resume_from = os.path.normpath(os.path.expanduser(config.resume_from))
+    #     if "checkpoint_" not in os.path.basename(config.resume_from):
+    #         # get the most recent checkpoint in this directory
+    #         checkpoints = list(
+    #             filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from))
+    #         )
+    #         if len(checkpoints) == 0:
+    #             raise ValueError(f"No checkpoints found in {config.resume_from}")
+    #         config.resume_from = os.path.join(
+    #             config.resume_from,
+    #             sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
+    #         )
+    model = load_model(config.pretrained)
 
     # number of timesteps within each trajectory to train on
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
@@ -88,26 +160,13 @@ def main(_):
     # set seed (device_specific is very important to get different prompts on different devices)
     set_seed(config.seed, device_specific=True)
 
-    # load scheduler, tokenizer and models.
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        config.pretrained.model, revision=config.pretrained.revision
-    )
+    
     # freeze parameters of models to save more memory
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    pipeline.unet.requires_grad_(not config.use_lora)
-    # disable safety checker
-    pipeline.safety_checker = None
-    # make the progress bar nicer
-    pipeline.set_progress_bar_config(
-        position=1,
-        disable=not accelerator.is_local_main_process,
-        leave=False,
-        desc="Timestep",
-        dynamic_ncols=True,
-    )
+    model.requires_grad_(not config.use_lora)
+
     # switch to DDIM scheduler
-    pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
+    scheduler = DDIMScheduler()
+    scheduler.num_inference_steps = config.sample.num_steps
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -117,54 +176,51 @@ def main(_):
     elif accelerator.mixed_precision == "bf16":
         inference_dtype = torch.bfloat16
 
-    # Move unet, vae and text_encoder to device and cast to inference_dtype
-    pipeline.vae.to(accelerator.device, dtype=inference_dtype)
-    pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
+    # Move model to device and cast to inference_dtype
     if config.use_lora:
-        pipeline.unet.to(accelerator.device, dtype=inference_dtype)
+        model.to(accelerator.device, dtype=inference_dtype)
 
     if config.use_lora:
+        # TODO: set correct lora layers
         # Set correct lora layers
         lora_attn_procs = {}
-        for name in pipeline.unet.attn_processors.keys():
+        for name in model.attn_processors.keys():
             cross_attention_dim = (
                 None
                 if name.endswith("attn1.processor")
-                else pipeline.unet.config.cross_attention_dim
+                else model.config.cross_attention_dim
             )
             if name.startswith("mid_block"):
-                hidden_size = pipeline.unet.config.block_out_channels[-1]
+                hidden_size = model.config.block_out_channels[-1]
             elif name.startswith("up_blocks"):
                 block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[
+                hidden_size = list(reversed(model.config.block_out_channels))[
                     block_id
                 ]
             elif name.startswith("down_blocks"):
                 block_id = int(name[len("down_blocks.")])
-                hidden_size = pipeline.unet.config.block_out_channels[block_id]
+                hidden_size = model.config.block_out_channels[block_id]
 
             lora_attn_procs[name] = LoRAAttnProcessor(
                 hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
             )
-        pipeline.unet.set_attn_processor(lora_attn_procs)
+        model.set_attn_processor(lora_attn_procs)
 
         # this is a hack to synchronize gradients properly. the module that registers the parameters we care about (in
         # this case, AttnProcsLayers) needs to also be used for the forward pass. AttnProcsLayers doesn't have a
         # `forward` method, so we wrap it to add one and capture the rest of the unet parameters using a closure.
         class _Wrapper(AttnProcsLayers):
             def forward(self, *args, **kwargs):
-                return pipeline.unet(*args, **kwargs)
+                return model(*args, **kwargs)
 
-        unet = _Wrapper(pipeline.unet.attn_processors)
-    else:
-        unet = pipeline.unet
+        model = _Wrapper(model.attn_processors)
 
     # set up diffusers-friendly checkpoint saving with Accelerate
 
     def save_model_hook(models, weights, output_dir):
         assert len(models) == 1
         if config.use_lora and isinstance(models[0], AttnProcsLayers):
-            pipeline.unet.save_attn_procs(output_dir)
+            model.save_attn_procs(output_dir)
         elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
             models[0].save_pretrained(os.path.join(output_dir, "unet"))
         else:
@@ -174,7 +230,7 @@ def main(_):
     def load_model_hook(models, input_dir):
         assert len(models) == 1
         if config.use_lora and isinstance(models[0], AttnProcsLayers):
-            # pipeline.unet.load_attn_procs(input_dir)
+            # model.load_attn_procs(input_dir)
             tmp_unet = UNet2DConditionModel.from_pretrained(
                 config.pretrained.model,
                 revision=config.pretrained.revision,
@@ -218,44 +274,19 @@ def main(_):
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        unet.parameters(),
+        model.parameters(),
         lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
         weight_decay=config.train.adam_weight_decay,
         eps=config.train.adam_epsilon,
     )
 
-    # prepare prompt and reward fn
-    prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)
-    reward_fn = getattr(ddpo_pytorch.rewards, config.reward_fn)()
-
-    # generate negative prompt embeddings
-    neg_prompt_embed = pipeline.text_encoder(
-        pipeline.tokenizer(
-            [""],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=pipeline.tokenizer.model_max_length,
-        ).input_ids.to(accelerator.device)
-    )[0]
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.batch_size, 1, 1)
-    train_neg_prompt_embeds = neg_prompt_embed.repeat(config.train.batch_size, 1, 1)
-
-    # initialize stat tracker
-    if config.per_prompt_stat_tracking:
-        stat_tracker = PerPromptStatTracker(
-            config.per_prompt_stat_tracking.buffer_size,
-            config.per_prompt_stat_tracking.min_count,
-        )
-
     # for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
     # more memory
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
-    # autocast = accelerator.autocast
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer = accelerator.prepare(unet, optimizer)
+    model, optimizer = accelerator.prepare(model, optimizer)
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
@@ -304,62 +335,49 @@ def main(_):
     global_step = 0
     for epoch in range(first_epoch, config.num_epochs):
         #################### SAMPLING ####################
-        pipeline.unet.eval()
+        model.eval()
         samples = []
-        prompts = []
         for i in tqdm(
             range(config.sample.num_batches_per_epoch),
             desc=f"Epoch {epoch}: sampling",
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
-            # generate prompts
-            prompts, prompt_metadata = zip(
-                *[
-                    prompt_fn(**config.prompt_fn_kwargs)
-                    for _ in range(config.sample.batch_size)
-                ]
-            )
-
-            # encode prompts
-            prompt_ids = pipeline.tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=pipeline.tokenizer.model_max_length,
-            ).input_ids.to(accelerator.device)
-            prompt_embeds = pipeline.text_encoder(prompt_ids)[0]
+            # generate conditions
+            cond = prepare_condition(config.conditions, config.sample.batch_size).to(accelerator.device)
 
             # sample
             with autocast():
                 images, _, latents, log_probs = pipeline_with_logprob(
-                    pipeline,
-                    prompt_embeds=prompt_embeds,
-                    negative_prompt_embeds=sample_neg_prompt_embeds,
+                    model,
+                    cond=cond,
+                    scheduler=scheduler,
+                    device=accelerator.device,
+                    batch_size = config.sample.batch_size,
+                    num_3d_points = config.pretrained.num_3d_points,
                     num_inference_steps=config.sample.num_steps,
                     guidance_scale=config.sample.guidance_scale,
                     eta=config.sample.eta,
-                    output_type="pt",
                 )
 
             latents = torch.stack(
                 latents, dim=1
             )  # (batch_size, num_steps + 1, 4, 64, 64)
             log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
-            timesteps = pipeline.scheduler.timesteps.repeat(
+            timesteps = scheduler.timesteps.repeat(
                 config.sample.batch_size, 1
             )  # (batch_size, num_steps)
 
             # compute rewards asynchronously
-            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
+            # TODO: run the reward function asynchronously
+            # rewards = executor.submit(reward_fn, images)
+            rewards = reward_fn(images)
             # yield to to make sure reward computation starts
             time.sleep(0)
 
             samples.append(
                 {
-                    "prompt_ids": prompt_ids,
-                    "prompt_embeds": prompt_embeds,
+                    "cond": cond,
                     "timesteps": timesteps,
                     "latents": latents[
                         :, :-1
@@ -379,36 +397,11 @@ def main(_):
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
-            rewards, reward_metadata = sample["rewards"].result()
-            # accelerator.print(reward_metadata)
-            sample["rewards"] = torch.as_tensor(rewards, device=accelerator.device)
-
+            sample["rewards"] = torch.as_tensor(sample["rewards"], device=accelerator.device)
+        
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
-
-        # this is a hack to force wandb to log the images as JPEGs instead of PNGs
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i, image in enumerate(images):
-                pil = Image.fromarray(
-                    (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-                )
-                pil = pil.resize((256, 256))
-                pil.save(os.path.join(tmpdir, f"{i}.jpg"))
-            accelerator.log(
-                {
-                    "images": [
-                        wandb.Image(
-                            os.path.join(tmpdir, f"{i}.jpg"),
-                            caption=f"{prompt:.25} | {reward:.2f}",
-                        )
-                        for i, (prompt, reward) in enumerate(
-                            zip(prompts, rewards)
-                        )  # only log rewards from process 0
-                    ],
-                },
-                step=global_step,
-            )
-
+        
         # gather rewards across processes
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
 
@@ -423,16 +416,7 @@ def main(_):
             step=global_step,
         )
 
-        # per-prompt mean/std tracking
-        if config.per_prompt_stat_tracking:
-            # gather the prompts across processes
-            prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
-            prompts = pipeline.tokenizer.batch_decode(
-                prompt_ids, skip_special_tokens=True
-            )
-            advantages = stat_tracker.update(prompts, rewards)
-        else:
-            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
         # ungather advantages; we only need to keep the entries corresponding to the samples on this process
         samples["advantages"] = (
@@ -442,7 +426,6 @@ def main(_):
         )
 
         del samples["rewards"]
-        del samples["prompt_ids"]
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         assert (
@@ -482,7 +465,7 @@ def main(_):
             ]
 
             # train
-            pipeline.unet.train()
+            model.train()
             info = defaultdict(list)
             for i, sample in tqdm(
                 list(enumerate(samples_batched)),
@@ -490,14 +473,7 @@ def main(_):
                 position=0,
                 disable=not accelerator.is_local_main_process,
             ):
-                if config.train.cfg:
-                    # concat negative prompts to sample prompts to avoid two forward passes
-                    embeds = torch.cat(
-                        [train_neg_prompt_embeds, sample["prompt_embeds"]]
-                    )
-                else:
-                    embeds = sample["prompt_embeds"]
-
+                cond = prepare_condition(config.conditions, config.sample.batch_size).to(accelerator.device)
                 for j in tqdm(
                     range(num_train_timesteps),
                     desc="Timestep",
@@ -505,29 +481,17 @@ def main(_):
                     leave=False,
                     disable=not accelerator.is_local_main_process,
                 ):
-                    with accelerator.accumulate(unet):
+                    with accelerator.accumulate(model):
                         with autocast():
-                            if config.train.cfg:
-                                noise_pred = unet(
-                                    torch.cat([sample["latents"][:, j]] * 2),
-                                    torch.cat([sample["timesteps"][:, j]] * 2),
-                                    embeds,
-                                ).sample
-                                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                                noise_pred = (
-                                    noise_pred_uncond
-                                    + config.sample.guidance_scale
-                                    * (noise_pred_text - noise_pred_uncond)
-                                )
-                            else:
-                                noise_pred = unet(
-                                    sample["latents"][:, j],
-                                    sample["timesteps"][:, j],
-                                    embeds,
-                                ).sample
+                            noise_pred = model(
+                                sample["latents"][:, j],
+                                cond,
+                                sample["timesteps"][:, j]
+                            )
+
                             # compute the log prob of next_latents given latents under the current model
                             _, log_prob = ddim_step_with_logprob(
-                                pipeline.scheduler,
+                                scheduler,
                                 noise_pred,
                                 sample["timesteps"][:, j],
                                 sample["latents"][:, j],
@@ -571,7 +535,7 @@ def main(_):
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
                             accelerator.clip_grad_norm_(
-                                unet.parameters(), config.train.max_grad_norm
+                                model.parameters(), config.train.max_grad_norm
                             )
                         optimizer.step()
                         optimizer.zero_grad()

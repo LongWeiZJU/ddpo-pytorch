@@ -30,14 +30,22 @@ def get_config():
     # attention layers of the UNet. with LoRA, fp16, and a batch size of 1, finetuning Stable Diffusion should take
     # about 10GB of GPU memory. beware that if LoRA is disabled, training will take a lot of memory and saved checkpoint
     # files will also be large.
-    config.use_lora = True
+    config.use_lora = False
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
     # base model to load. either a path to a local directory, or a model name from the HuggingFace model hub.
-    pretrained.model = "runwayml/stable-diffusion-v1-5"
+    # pretrained.model = "runwayml/stable-diffusion-v1-5"
+    # pretrained.model = "PrunaAI/runwayml-stable-diffusion-v1-5-turbo-tiny-green-smashed"
     # revision of the model to load.
-    pretrained.revision = "main"
+    # pretrained.revision = "main" 
+    
+    # path to a local checkpoint file. if provided, this will be used instead of loading a model from the model hub.
+    pretrained.model_path = "/data/weilong/airfoil_design/3d_wings/checkpoints/bsize8_diffsteps1000_modelhead4/model-20.pt"
+    # number of points in the 3D point cloud
+    pretrained.num_3d_points = 4656
+    # number of heads in transformer
+    pretrained.n_head = 4
 
     ###### Sampling ######
     config.sample = sample = ml_collections.ConfigDict()
@@ -88,26 +96,17 @@ def get_config():
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 1.0
-
-    ###### Prompt Function ######
-    # prompt function to use. see `prompts.py` for available prompt functions.
-    config.prompt_fn = "imagenet_animals"
-    # kwargs to pass to the prompt function.
-    config.prompt_fn_kwargs = {}
-
     ###### Reward Function ######
-    # reward function to use. see `rewards.py` for available reward functions.
-    config.reward_fn = "jpeg_compressibility"
+    # reward function to use.
+    config.reward_fn = "3d_aircraft_design"
 
-    ###### Per-Prompt Stat Tracking ######
-    # when enabled, the model will track the mean and std of reward on a per-prompt basis and use that to compute
-    # advantages. set `config.per_prompt_stat_tracking` to None to disable per-prompt stat tracking, in which case
-    # advantages will be calculated using the mean and std of the entire batch.
-    config.per_prompt_stat_tracking = ml_collections.ConfigDict()
-    # number of reward values to store in the buffer for each prompt. the buffer persists across epochs.
-    config.per_prompt_stat_tracking.buffer_size = 16
-    # the minimum number of reward values to store in the buffer before using the per-prompt mean and std. if the buffer
-    # contains fewer than `min_count` values, the mean and std of the entire batch will be used instead.
-    config.per_prompt_stat_tracking.min_count = 16
-
+    ###### conditions for aircraft generation ######
+    config.conditions = ml_collections.ConfigDict()
+    config.conditions.alpha = 0.0
+    config.conditions.Ma = 0.1
+    config.conditions.Cl = 1.0
+    config.conditions.Cd = 0.01
+    config.conditions.cond_force = False
+    config.conditions.normdict_path = "/data/weilong/airfoil_design/3d_wings/min_max.pkl"
+    
     return config
